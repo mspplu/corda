@@ -175,3 +175,8 @@ class IllegalMembershipStatusException(message: String) : FlowException(message)
  * Exception thrown by any [MembershipManagementFlow] whenever membership fails role based authorisation.
  */
 class MembershipAuthorisationException(message: String) : FlowException(message)
+
+/**
+ * Exception thrown by any [MembershipManagementFlow] whenever Business Network group with provided [GroupState.linearId] doesn't exist.
+ */
+class BusinessNetworkGroupNotFoundException(message: String) : FlowException(message)

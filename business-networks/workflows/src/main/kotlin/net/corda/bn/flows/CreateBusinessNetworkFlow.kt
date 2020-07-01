@@ -2,14 +2,13 @@ package net.corda.bn.flows
 
 import co.paralleluniverse.fibers.Suspendable
 import net.corda.bn.contracts.MembershipContract
-import net.corda.bn.contracts.RelationshipContract
-import net.corda.bn.states.BNGroup
+import net.corda.bn.contracts.GroupContract
 import net.corda.bn.states.BNIdentity
 import net.corda.bn.states.BNORole
+import net.corda.bn.states.GroupState
 import net.corda.bn.states.MembershipIdentity
 import net.corda.bn.states.MembershipState
 import net.corda.bn.states.MembershipStatus
-import net.corda.bn.states.RelationshipState
 import net.corda.core.contracts.StateAndRef
 import net.corda.core.contracts.UniqueIdentifier
 import net.corda.core.flows.FinalityFlow
@@ -90,11 +89,11 @@ class CreateBusinessNetworkFlow(
     }
 
     @Suspendable
-    private fun createBusinessNetworkGroup(membershipId: UniqueIdentifier): SignedTransaction {
-        val relationship = RelationshipState(membershipId = membershipId, groups = setOf(BNGroup(groupId, groupName)))
+    private fun createBusinessNetworkGroup(): SignedTransaction {
+        val group = GroupState(networkId = networkId.toString(), name = groupName, linearId = groupId, participants = listOf(ourIdentity))
         val builder = TransactionBuilder(notary ?: serviceHub.networkMapCache.notaryIdentities.first())
-                .addOutputState(relationship)
-                .addCommand(RelationshipContract.Commands.Issue(), ourIdentity.owningKey)
+                .addOutputState(group)
+                .addCommand(GroupContract.Commands.Create(), ourIdentity.owningKey)
         builder.verify(serviceHub)
 
         val stx = serviceHub.signInitialTransaction(builder)
@@ -110,8 +109,7 @@ class CreateBusinessNetworkFlow(
         // give all administrative permissions to the membership
         return authoriseMembership(activeMembership).apply {
             // in the end create initial business network relationships group
-            val authorisedMembership = tx.outRefsOfType(MembershipState::class.java).single()
-            createBusinessNetworkGroup(authorisedMembership.state.data.linearId)
+            createBusinessNetworkGroup()
         }
     }
 }

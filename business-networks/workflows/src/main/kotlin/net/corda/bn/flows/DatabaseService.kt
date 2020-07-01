@@ -1,6 +1,7 @@
 package net.corda.bn.flows
 
 import net.corda.bn.schemas.MembershipStateSchemaV1
+import net.corda.bn.states.GroupState
 import net.corda.bn.states.MembershipState
 import net.corda.bn.states.MembershipStatus
 import net.corda.core.contracts.StateAndRef
@@ -23,13 +24,13 @@ import net.corda.core.serialization.SingletonSerializeAsToken
 class DatabaseService(private val serviceHub: ServiceHub) : SingletonSerializeAsToken() {
 
     /**
-     * Checks whether Business Network with [networkID] ID exists.
+     * Checks whether Business Network with [networkId] ID exists.
      *
-     * @param networkID ID of the Business Network.
+     * @param networkId ID of the Business Network.
      */
-    fun businessNetworkExists(networkID: String): Boolean {
+    fun businessNetworkExists(networkId: String): Boolean {
         val criteria = QueryCriteria.VaultQueryCriteria(Vault.StateStatus.ALL)
-                .and(networkIdCriteria(networkID))
+                .and(networkIdCriteria(networkId))
         return serviceHub.vaultService.queryBy<MembershipState>(criteria).states.isNotEmpty()
     }
 
@@ -92,6 +93,19 @@ class DatabaseService(private val serviceHub: ServiceHub) : SingletonSerializeAs
             MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED
     ).filter {
         it.state.data.canModifyMembership()
+    }
+
+    fun businessNetworkGroupExists(groupId: UniqueIdentifier): Boolean {
+        val criteria = QueryCriteria.VaultQueryCriteria(Vault.StateStatus.ALL)
+                .and(linearIdCriteria(groupId))
+        return serviceHub.vaultService.queryBy<GroupState>(criteria).states.isNotEmpty()
+    }
+
+    fun getBusinessNetworkGroup(groupId: UniqueIdentifier): StateAndRef<GroupState>? {
+        val criteria = QueryCriteria.VaultQueryCriteria(Vault.StateStatus.UNCONSUMED)
+                .and(linearIdCriteria(groupId))
+        val states = serviceHub.vaultService.queryBy<GroupState>(criteria).states
+        return states.maxBy { it.state.data.modified }
     }
 
     private fun networkIdCriteria(networkID: String) = QueryCriteria.VaultCustomQueryCriteria(builder { MembershipStateSchemaV1.PersistentMembershipState::networkId.equal(networkID) })
