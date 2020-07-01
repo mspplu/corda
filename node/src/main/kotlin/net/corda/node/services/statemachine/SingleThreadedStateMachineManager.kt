@@ -992,4 +992,10 @@ class SingleThreadedStateMachineManager(
             }
         }
     }
+
+    override fun removeClientId(clientID: String): Boolean {
+        return mutex.locked {
+            clientIDsToFlowIds.remove(clientID) != null
+        }
+    }
 }
