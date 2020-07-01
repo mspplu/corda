@@ -170,15 +170,8 @@ class SingleThreadedStateMachineManager(
 
         val fibers = restoreFlowsFromCheckpoints()
         metrics.register("Flows.InFlight", Gauge<Int> { mutex.content.flows.size })
-        Fiber.setDefaultUncaughtExceptionHandler { fiber, throwable ->
-            if (throwable is VirtualMachineError) {
-                errorAndTerminate("Caught unrecoverable error from flow. Forcibly terminating the JVM, this might leave resources open, and most likely will.", throwable)
-            } else {
-                (fiber as FlowStateMachineImpl<*>).logger.warn("Caught exception from flow", throwable)
-                (fiber.resultFuture as? OpenFuture<*>)?.setException(throwable)
-                decrementLiveFibers()
-            }
-        }
+
+        setFlowDefaultUncaughtExceptionHandler()
 
         val pausedFlows = restoreNonResidentFlowsFromPausedCheckpoints()
         mutex.locked {
@@ -199,6 +192,17 @@ class SingleThreadedStateMachineManager(
                 }
             }
         }
+    }
+
+    private fun setFlowDefaultUncaughtExceptionHandler() {
+        Fiber.setDefaultUncaughtExceptionHandler(
+            FlowDefaultUncaughtExceptionHandler(
+                flowHospital,
+                checkpointStorage,
+                database,
+                scheduledFutureExecutor
+            )
+        )
     }
 
     override fun snapshot(): Set<FlowStateMachineImpl<*>> = mutex.content.flows.values.map { it.fiber }.toSet()
@@ -463,7 +467,7 @@ class SingleThreadedStateMachineManager(
                     ?.map { it.exception }
                     ?.plus(e) ?: emptyList()
             logger.info("Failed to retry flow $flowId, keeping in for observation and aborting")
-            flowHospital.forceIntoOvernightObservation(flowId, exceptions)
+            flowHospital.forceIntoOvernightObservation(currentState, exceptions)
             throw e
         }
     }

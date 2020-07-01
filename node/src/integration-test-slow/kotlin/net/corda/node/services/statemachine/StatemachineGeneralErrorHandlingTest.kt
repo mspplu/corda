@@ -4,6 +4,7 @@ import net.corda.client.rpc.CordaRPCClient
 import net.corda.core.messaging.startFlow
 import net.corda.core.utilities.getOrThrow
 import net.corda.core.utilities.seconds
+import net.corda.node.services.api.CheckpointStorage
 import net.corda.node.services.messaging.DeduplicationHandler
 import net.corda.node.services.statemachine.transitions.TopLevelTransition
 import net.corda.testing.core.ALICE_NAME
@@ -11,12 +12,18 @@ import net.corda.testing.core.CHARLIE_NAME
 import net.corda.testing.core.singleIdentity
 import org.junit.Ignore
 import org.junit.Test
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeoutException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
 @Suppress("MaxLineLength") // Byteman rules cannot be easily wrapped
 class StatemachineGeneralErrorHandlingTest : StatemachineErrorHandlingTest() {
+
+    private companion object {
+        val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    }
 
     /**
      * Throws an exception when performing an [Action.SendInitial] action.
@@ -1276,6 +1283,194 @@ class StatemachineGeneralErrorHandlingTest : StatemachineErrorHandlingTest() {
             assertEquals(1, aliceClient.startFlow(StatemachineErrorHandlingTest::GetNumberOfUncompletedCheckpointsFlow).returnValue.get())
             // 1 for GetNumberOfCheckpointsFlow
             assertEquals(1, charlieClient.startFlow(StatemachineErrorHandlingTest::GetNumberOfUncompletedCheckpointsFlow).returnValue.get())
+        }
+    }
+
+    /**
+     * Throws an exception when calling [FlowStateMachineImpl.recordDuration] to cause an unexpected error during flow initialisation.
+     *
+     * The hospital has the flow's medical history updated with the new failure added to it. As the failure occurred before the original
+     * checkpoint was persisted, there is no checkpoint to update in the database.
+     */
+    @Test(timeout = 300_000)
+    fun `unexpected error during flow initialisation that gets caught by default exception handler puts flow into in-memory overnight observation`() {
+        startDriver {
+            val charlie = createNode(CHARLIE_NAME)
+            val alice = createBytemanNode(ALICE_NAME)
+            val rules = """
+                RULE Create Counter
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD recordDuration
+                AT ENTRY
+                IF createCounter("counter", $counter)
+                DO traceln("Counter created")
+                ENDRULE
+                
+                RULE Throw exception
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD openThreadLocalWormhole
+                AT ENTRY
+                IF readCounter("counter") < 1
+                DO incrementCounter("counter"); traceln("Throwing exception"); throw new java.lang.RuntimeException("die dammit die")
+                ENDRULE
+            """.trimIndent()
+
+            submitBytemanRules(rules)
+
+            executor.execute {
+                alice.rpc.startFlow(
+                    StatemachineErrorHandlingTest::SendAMessageFlow,
+                    charlie.nodeInfo.singleIdentity()
+                )
+            }
+
+            Thread.sleep(10.seconds.toMillis())
+
+            val (discharge, observation) = alice.rpc.startFlow(StatemachineErrorHandlingTest::GetHospitalCountersFlow).returnValue.get()
+            assertEquals(0, discharge)
+            assertEquals(1, observation)
+            assertEquals(1, alice.rpc.stateMachinesSnapshot().size)
+            // The flow failed during flow initialisation before committing the original checkpoint
+            // therefore there is no checkpoint to update the status of
+            assertEquals(0, alice.rpc.startFlow(StatemachineErrorHandlingTest::GetNumberOfHospitalizedCheckpointsFlow).returnValue.get())
+        }
+    }
+
+    /**
+     * Throws an exception when calling [FlowStateMachineImpl.logFlowError] to cause an unexpected error after the flow has properly
+     * initialised.
+     *
+     * The hospital has the flow's medical history updated with the new failure added to it. The status of the checkpoint is also set to
+     * [Checkpoint.FlowStatus.HOSPITALIZED] to reflect this information in the database.
+     */
+    @Test(timeout = 300_000)
+    fun `unexpected error after flow initialisation that gets caught by default exception handler puts flow into overnight observation and reflected in database`() {
+        startDriver {
+            val alice = createBytemanNode(ALICE_NAME)
+            val rules = """
+                RULE Create Counter
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD recordDuration
+                AT ENTRY
+                IF createCounter("counter", $counter)
+                DO traceln("Counter created")
+                ENDRULE
+                
+                RULE Throw exception
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD logFlowError
+                AT ENTRY
+                IF readCounter("counter") < 1
+                DO incrementCounter("counter"); traceln("Throwing exception"); throw new java.lang.RuntimeException("die dammit die")
+                ENDRULE
+            """.trimIndent()
+
+            submitBytemanRules(rules)
+
+            assertFailsWith<TimeoutException> {
+                alice.rpc.startFlow(StatemachineErrorHandlingTest::ThrowAnErrorFlow).returnValue.getOrThrow(30.seconds)
+            }
+
+            val (discharge, observation) = alice.rpc.startFlow(StatemachineErrorHandlingTest::GetHospitalCountersFlow).returnValue.get()
+            assertEquals(0, discharge)
+            assertEquals(1, observation)
+            assertEquals(1, alice.rpc.stateMachinesSnapshot().size)
+            assertEquals(1, alice.rpc.startFlow(StatemachineErrorHandlingTest::GetNumberOfHospitalizedCheckpointsFlow).returnValue.get())
+        }
+    }
+
+    /**
+     * Throws an exception when calling [FlowStateMachineImpl.logFlowError] to cause an unexpected error after the flow has properly
+     * initialised. When updating the status of the flow to [Checkpoint.FlowStatus.HOSPITALIZED] an error occurs.
+     *
+     * The update is rescheduled and tried again. This is done separate from the fiber.
+     */
+    @Test(timeout = 300_000)
+    fun `unexpected error after flow initialisation that gets caught by default exception handler retries the status update if it fails`() {
+        startDriver {
+            val alice = createBytemanNode(ALICE_NAME)
+            val rules = """
+                RULE Create Counter
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD recordDuration
+                AT ENTRY
+                IF createCounter("counter", $counter)
+                DO traceln("Counter created")
+                ENDRULE
+                
+                RULE Throw exception
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD logFlowError
+                AT ENTRY
+                IF readCounter("counter") < 1
+                DO incrementCounter("counter"); traceln("Throwing exception"); throw new java.lang.RuntimeException("die dammit die")
+                ENDRULE
+                
+                RULE Throw exception when updating status
+                INTERFACE ${CheckpointStorage::class.java.name}
+                METHOD updateStatus
+                AT ENTRY
+                IF readCounter("counter") < 2
+                DO incrementCounter("counter"); traceln("Throwing exception"); throw new java.lang.RuntimeException("should be a sql exception")
+                ENDRULE
+            """.trimIndent()
+
+            submitBytemanRules(rules)
+
+            assertFailsWith<TimeoutException> {
+                alice.rpc.startFlow(StatemachineErrorHandlingTest::ThrowAnErrorFlow).returnValue.getOrThrow(50.seconds)
+            }
+
+            val (discharge, observation) = alice.rpc.startFlow(StatemachineErrorHandlingTest::GetHospitalCountersFlow).returnValue.get()
+            assertEquals(0, discharge)
+            assertEquals(1, observation)
+            assertEquals(1, alice.rpc.stateMachinesSnapshot().size)
+            assertEquals(1, alice.rpc.startFlow(StatemachineErrorHandlingTest::GetNumberOfHospitalizedCheckpointsFlow).returnValue.get())
+        }
+    }
+
+    /**
+     * Throws an exception when calling [FlowStateMachineImpl.recordDuration] to cause an unexpected error after a flow has returned its
+     * result to the client.
+     *
+     * As the flow has already returned its result to the client, then the status of the flow has already been updated correctly and now the
+     * flow has experienced an unexpected error. There is no need to change the status as the flow has already finished.
+     */
+    @Test(timeout = 300_000)
+    fun `unexpected error after flow has returned result to client that gets caught by default exception handler does nothing except log`() {
+        startDriver {
+            val charlie = createNode(CHARLIE_NAME)
+            val alice = createBytemanNode(ALICE_NAME)
+            val rules = """
+                RULE Create Counter
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD recordDuration
+                AT ENTRY
+                IF createCounter("counter", $counter)
+                DO traceln("Counter created")
+                ENDRULE
+                
+                RULE Throw exception
+                CLASS ${FlowStateMachineImpl::class.java.name}
+                METHOD recordDuration
+                AT ENTRY
+                IF readCounter("counter") < 1
+                DO incrementCounter("counter"); traceln("Throwing exception"); throw new java.lang.RuntimeException("die dammit die")
+                ENDRULE
+            """.trimIndent()
+
+            submitBytemanRules(rules)
+
+            alice.rpc.startFlow(
+                StatemachineErrorHandlingTest::SendAMessageFlow,
+                charlie.nodeInfo.singleIdentity()
+            ).returnValue.getOrThrow(30.seconds)
+
+            val (discharge, observation) = alice.rpc.startFlow(StatemachineErrorHandlingTest::GetHospitalCountersFlow).returnValue.get()
+            assertEquals(0, discharge)
+            assertEquals(0, observation)
+            assertEquals(0, alice.rpc.stateMachinesSnapshot().size)
+            assertEquals(0, alice.rpc.startFlow(StatemachineErrorHandlingTest::GetNumberOfHospitalizedCheckpointsFlow).returnValue.get())
         }
     }
 }
